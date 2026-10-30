@@ -22,7 +22,8 @@
         "title": "Opcje Google Cloud STT",
         "description": "Wybierz preferowany model.",
         "data": {
-          "model": "Model"
+          "model": "Model",
+          "location": "Lokalizacja"
         }
       }
     }

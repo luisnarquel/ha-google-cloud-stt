@@ -20,9 +20,10 @@
     "step": {
       "init": {
         "title": "Google Cloud STT Options",
-        "description": "Select your preferred model.",
+        "description": "Select your preferred model. The location only applies to V2 models (such as chirp_3).",
         "data": {
-          "model": "Model"
+          "model": "Model",
+          "location": "Location"
         }
       }
     }

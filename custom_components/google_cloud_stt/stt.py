@@ -6,9 +6,9 @@ import asyncio
 from collections.abc import AsyncIterable
 import os
 
-from google.cloud import (
-    speech,  # Use speech v1. For the moment speech v2 is in preview and has fewer supported languages
-)
+from google.api_core.client_options import ClientOptions
+from google.cloud import speech, speech_v2
+from google.cloud.speech_v2.types import cloud_speech
 
 from homeassistant.components import stt
 from homeassistant.components.stt import (
@@ -28,7 +28,15 @@ from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
 
-from .const import _LOGGER, DEFAULT_MODEL, DOMAIN, SERVICE_ACCOUNT_INFO
+from .const import (
+    _LOGGER,
+    CONF_LOCATION,
+    DEFAULT_LOCATION,
+    DEFAULT_MODEL,
+    DOMAIN,
+    SERVICE_ACCOUNT_INFO,
+    V2_MODELS,
+)
 
 SUPPORTED_LANGUAGES = [
     "af-ZA",
@@ -179,7 +187,10 @@ async def async_setup_entry(
     async_add_entities(
         [
             GoogleCloudSTTProvider(
-                hass, config_entry.data[SERVICE_ACCOUNT_INFO], config_entry.options.get(CONF_MODEL, DEFAULT_MODEL)
+                hass,
+                config_entry.data[SERVICE_ACCOUNT_INFO],
+                config_entry.options.get(CONF_MODEL, DEFAULT_MODEL),
+                config_entry.options.get(CONF_LOCATION, DEFAULT_LOCATION),
             ),
         ]
     )
@@ -222,14 +233,15 @@ async def async_get_engine(hass, config, discovery_info=None):
 class GoogleCloudSTTProvider(stt.SpeechToTextEntity):
     """The Google Cloud STT API provider."""
 
-    _attr_name = "Google Cloud"
+    _attr_name = "Google Cloud STT"
     _attr_unique_id = "google-cloud-speech-to-text"
 
-    def __init__(self, hass, service_account_info, model) -> None:
+    def __init__(self, hass, service_account_info, model, location) -> None:
         """Init Google Cloud STT service."""
         self.hass = hass
 
         self._model = model
+        self._location = location
         self._service_account_info = service_account_info
         self._client = None
 
@@ -272,6 +284,24 @@ class GoogleCloudSTTProvider(stt.SpeechToTextEntity):
         async for chunk in stream:
             audio_data += chunk
 
+        recognize = (
+            self._recognize_v2 if self._model in V2_MODELS else self._recognize_v1
+        )
+
+        async with asyncio.timeout(10):
+            assert self.hass
+            response = await self.hass.async_add_executor_job(
+                recognize, audio_data, metadata
+            )
+            if response.results and response.results[0].alternatives:
+                return SpeechResult(
+                    response.results[0].alternatives[0].transcript,
+                    SpeechResultState.SUCCESS,
+                )
+            return SpeechResult(None, SpeechResultState.ERROR)
+
+    def _recognize_v1(self, audio_data: bytes, metadata: SpeechMetadata):
+        """Recognize audio with the V1 API."""
         audio = speech.RecognitionAudio(content=audio_data)
         encoding = (
             speech.RecognitionConfig.AudioEncoding.OGG_OPUS
@@ -285,19 +315,46 @@ class GoogleCloudSTTProvider(stt.SpeechToTextEntity):
             model=self._model,
         )
 
-        def job():
-            # Create the client on first use, so that it is created inside the executor job
-            if self._client is None:
-                self._client = speech.SpeechClient.from_service_account_info(self._service_account_info)
+        # Create the client on first use, so that it is created inside the executor job
+        if self._client is None:
+            self._client = speech.SpeechClient.from_service_account_info(self._service_account_info)
 
-            return self._client.recognize(config=config, audio=audio)
+        return self._client.recognize(config=config, audio=audio)
 
-        async with asyncio.timeout(10):
-            assert self.hass
-            response = await self.hass.async_add_executor_job(job)
-            if response.results and response.results[0].alternatives:
-                return SpeechResult(
-                    response.results[0].alternatives[0].transcript,
-                    SpeechResultState.SUCCESS,
-                )
-            return SpeechResult(None, SpeechResultState.ERROR)
+    def _recognize_v2(self, audio_data: bytes, metadata: SpeechMetadata):
+        """Recognize audio with the V2 API, which uses regional endpoints."""
+        encoding = (
+            cloud_speech.ExplicitDecodingConfig.AudioEncoding.OGG_OPUS
+            if metadata.codec == AudioCodecs.OPUS
+            else cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16
+        )
+        config = cloud_speech.RecognitionConfig(
+            explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
+                encoding=encoding,
+                sample_rate_hertz=metadata.sample_rate,
+                audio_channel_count=metadata.channel,
+            ),
+            language_codes=[metadata.language],
+            model=self._model,
+        )
+        project_id = self._service_account_info["project_id"]
+
+        # Create the client on first use, so that it is created inside the executor job
+        if self._client is None:
+            endpoint = (
+                "speech.googleapis.com"
+                if self._location == "global"
+                else f"{self._location}-speech.googleapis.com"
+            )
+            self._client = speech_v2.SpeechClient.from_service_account_info(
+                self._service_account_info,
+                client_options=ClientOptions(api_endpoint=endpoint),
+            )
+
+        return self._client.recognize(
+            request=cloud_speech.RecognizeRequest(
+                recognizer=f"projects/{project_id}/locations/{self._location}/recognizers/_",
+                config=config,
+                content=audio_data,
+            )
+        )

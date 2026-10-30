@@ -10,16 +10,19 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.components.file_upload import process_uploaded_file
-from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_MODEL
 from homeassistant.core import callback
 from homeassistant.helpers.selector import FileSelector, FileSelectorConfig
 
 from .const import (
     _LOGGER,
+    CONF_LOCATION,
+    DEFAULT_LOCATION,
     DEFAULT_MODEL,
     DOMAIN,
     SERVICE_ACCOUNT_INFO,
+    SUPPORTED_LOCATIONS,
     SUPPORTED_MODELS,
 )
 
@@ -30,12 +33,6 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required(UPLOADED_FILE): FileSelector(
                         FileSelectorConfig(accept=".json,application/json")
                     )
-    }
-)
-
-OPTIONS_SCHEMA = vol.Schema(
-    {
-        vol.Optional(CONF_MODEL, default=DEFAULT_MODEL): vol.In(SUPPORTED_MODELS),
     }
 )
 
@@ -79,7 +76,7 @@ class GoogleCloudConfigFlow(ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
         """Create the options flow."""
-        return GoogleCloudOptionsFlowHandler(config_entry)
+        return GoogleCloudOptionsFlowHandler()
 
     async def async_step_import(self, import_data: dict[str, Any]) -> ConfigFlowResult:
         """Import Google Cloud STT configuration from YAML."""
@@ -104,12 +101,25 @@ class GoogleCloudConfigFlow(ConfigFlow, domain=DOMAIN):
 class GoogleCloudOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle a options flow for Google Cloud STT integration."""
 
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        """Initialize Google Cloud STT options flow."""
-        self.config_entry = config_entry
-
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage the options."""
-        return self.async_show_form(step_id="init", data_schema=OPTIONS_SCHEMA)
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        options = self.config_entry.options
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_MODEL, default=options.get(CONF_MODEL, DEFAULT_MODEL)
+                    ): vol.In(SUPPORTED_MODELS),
+                    vol.Optional(
+                        CONF_LOCATION,
+                        default=options.get(CONF_LOCATION, DEFAULT_LOCATION),
+                    ): vol.In(SUPPORTED_LOCATIONS),
+                }
+            ),
+        )
