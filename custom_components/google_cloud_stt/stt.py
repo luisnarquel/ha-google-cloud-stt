@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, AsyncIterator
 import os
 
 from google.api_core.client_options import ClientOptions
+from google.api_core.exceptions import (
+    Aborted,
+    GoogleAPIError,
+    InternalServerError,
+    ServiceUnavailable,
+)
 from google.cloud import speech, speech_v2
 from google.cloud.speech_v2.types import cloud_speech
 
@@ -37,6 +43,13 @@ from .const import (
     SERVICE_ACCOUNT_INFO,
     V2_MODELS,
 )
+
+# Requests in a stream can't carry more than 25 KB of audio
+MAX_REQUEST_AUDIO = 25000
+TIMEOUT = 30
+ATTEMPTS = 3
+RETRY_DELAY = 0.1
+RETRYABLE_ERRORS = (Aborted, InternalServerError, ServiceUnavailable)
 
 SUPPORTED_LANGUAGES = [
     "af-ZA",
@@ -183,16 +196,35 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Google Cloud speech-to-text."""
+    service_account_info = config_entry.data[SERVICE_ACCOUNT_INFO]
+    model = config_entry.options.get(CONF_MODEL, DEFAULT_MODEL)
+    location = config_entry.options.get(CONF_LOCATION, DEFAULT_LOCATION)
 
     async_add_entities(
         [
             GoogleCloudSTTProvider(
-                hass,
-                config_entry.data[SERVICE_ACCOUNT_INFO],
-                config_entry.options.get(CONF_MODEL, DEFAULT_MODEL),
-                config_entry.options.get(CONF_LOCATION, DEFAULT_LOCATION),
+                _create_client(service_account_info, model, location),
+                model,
+                location,
+                service_account_info["project_id"],
             ),
         ]
+    )
+
+
+def _create_client(service_account_info, model, location):
+    """Create the client of the API that serves the model."""
+    if model not in V2_MODELS:
+        return speech.SpeechAsyncClient.from_service_account_info(service_account_info)
+
+    endpoint = (
+        "speech.googleapis.com"
+        if location == "global"
+        else f"{location}-speech.googleapis.com"
+    )
+    return speech_v2.SpeechAsyncClient.from_service_account_info(
+        service_account_info,
+        client_options=ClientOptions(api_endpoint=endpoint),
     )
 
 
@@ -230,20 +262,66 @@ async def async_get_engine(hass, config, discovery_info=None):
         )
 
 
+class AudioReplay:
+    """Read an audio stream once, so that every attempt can send all of it.
+
+    A failed call must not cancel the read of the live stream, so it happens in
+    its own task.
+    """
+
+    def __init__(self, stream: AsyncIterable[bytes]) -> None:
+        """Start reading the stream."""
+        self._chunks: list[bytes] = []
+        self._done = False
+        self._changed = asyncio.Event()
+        self._reader = asyncio.create_task(self._read(stream))
+
+    async def _read(self, stream: AsyncIterable[bytes]) -> None:
+        """Keep the chunks of the stream."""
+        try:
+            async for chunk in stream:
+                self._chunks.append(chunk)
+                self._notify()
+        finally:
+            self._done = True
+            self._notify()
+
+    def _notify(self) -> None:
+        """Wake up the attempt that is waiting for audio."""
+        self._changed.set()
+        self._changed = asyncio.Event()
+
+    async def chunks(self) -> AsyncIterator[bytes]:
+        """Yield the stream from the start, within the request size limit."""
+        sent = 0
+        while True:
+            if sent < len(self._chunks):
+                chunk = self._chunks[sent]
+                sent += 1
+                for start in range(0, len(chunk), MAX_REQUEST_AUDIO):
+                    yield chunk[start : start + MAX_REQUEST_AUDIO]
+            elif self._done:
+                return
+            else:
+                await self._changed.wait()
+
+    def close(self) -> None:
+        """Stop reading the stream."""
+        self._reader.cancel()
+
+
 class GoogleCloudSTTProvider(stt.SpeechToTextEntity):
     """The Google Cloud STT API provider."""
 
     _attr_name = "Google Cloud STT"
     _attr_unique_id = "google-cloud-speech-to-text"
 
-    def __init__(self, hass, service_account_info, model, location) -> None:
+    def __init__(self, client, model, location, project_id) -> None:
         """Init Google Cloud STT service."""
-        self.hass = hass
-
+        self._client = client
         self._model = model
         self._location = location
-        self._service_account_info = service_account_info
-        self._client = None
+        self._project_id = project_id
 
     @property
     def supported_languages(self) -> list[str]:
@@ -279,82 +357,89 @@ class GoogleCloudSTTProvider(stt.SpeechToTextEntity):
         self, metadata: SpeechMetadata, stream: AsyncIterable[bytes]
     ) -> SpeechResult:
         """Process an audio stream to STT service."""
-        # Collect data
-        audio_data = b""
-        async for chunk in stream:
-            audio_data += chunk
-
-        recognize = (
-            self._recognize_v2 if self._model in V2_MODELS else self._recognize_v1
+        audio = AudioReplay(stream)
+        requests = (
+            self._requests_v2 if self._model in V2_MODELS else self._requests_v1
         )
 
-        async with asyncio.timeout(10):
-            assert self.hass
-            response = await self.hass.async_add_executor_job(
-                recognize, audio_data, metadata
-            )
-            if response.results and response.results[0].alternatives:
-                return SpeechResult(
-                    response.results[0].alternatives[0].transcript,
-                    SpeechResultState.SUCCESS,
-                )
+        try:
+            async with asyncio.timeout(TIMEOUT):
+                for attempt in range(1, ATTEMPTS + 1):
+                    try:
+                        transcript = await self._recognize(requests(audio, metadata))
+                        break
+                    except RETRYABLE_ERRORS as err:
+                        if attempt == ATTEMPTS:
+                            raise
+                        _LOGGER.warning("Retrying after error: %s", err)
+                        await asyncio.sleep(RETRY_DELAY * attempt)
+        except (GoogleAPIError, TimeoutError) as err:
+            _LOGGER.error("Error during speech recognition: %r", err)
             return SpeechResult(None, SpeechResultState.ERROR)
+        finally:
+            audio.close()
 
-    def _recognize_v1(self, audio_data: bytes, metadata: SpeechMetadata):
-        """Recognize audio with the V1 API."""
-        audio = speech.RecognitionAudio(content=audio_data)
+        if transcript:
+            return SpeechResult(transcript, SpeechResultState.SUCCESS)
+        return SpeechResult(None, SpeechResultState.ERROR)
+
+    async def _recognize(self, requests: AsyncIterator) -> str:
+        """Stream the requests, returning the whole transcript."""
+        responses = await self._client.streaming_recognize(
+            requests=requests, retry=None, timeout=TIMEOUT
+        )
+
+        transcripts = []
+        async for response in responses:
+            for result in response.results:
+                if result.alternatives:
+                    transcripts.append(result.alternatives[0].transcript.strip())
+        return " ".join(filter(None, transcripts))
+
+    async def _requests_v1(
+        self, audio: AudioReplay, metadata: SpeechMetadata
+    ) -> AsyncIterator[speech.StreamingRecognizeRequest]:
+        """Yield the requests of a V1 stream."""
         encoding = (
             speech.RecognitionConfig.AudioEncoding.OGG_OPUS
             if metadata.codec == AudioCodecs.OPUS
             else speech.RecognitionConfig.AudioEncoding.LINEAR16
         )
-        config = speech.RecognitionConfig(
-            language_code=metadata.language,
-            encoding=encoding,
-            sample_rate_hertz=metadata.sample_rate,
-            model=self._model,
+        yield speech.StreamingRecognizeRequest(
+            streaming_config=speech.StreamingRecognitionConfig(
+                config=speech.RecognitionConfig(
+                    language_code=metadata.language,
+                    encoding=encoding,
+                    sample_rate_hertz=metadata.sample_rate,
+                    model=self._model,
+                )
+            )
         )
+        async for chunk in audio.chunks():
+            yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-        # Create the client on first use, so that it is created inside the executor job
-        if self._client is None:
-            self._client = speech.SpeechClient.from_service_account_info(self._service_account_info)
-
-        return self._client.recognize(config=config, audio=audio)
-
-    def _recognize_v2(self, audio_data: bytes, metadata: SpeechMetadata):
-        """Recognize audio with the V2 API, which uses regional endpoints."""
+    async def _requests_v2(
+        self, audio: AudioReplay, metadata: SpeechMetadata
+    ) -> AsyncIterator[cloud_speech.StreamingRecognizeRequest]:
+        """Yield the requests of a V2 stream."""
         encoding = (
             cloud_speech.ExplicitDecodingConfig.AudioEncoding.OGG_OPUS
             if metadata.codec == AudioCodecs.OPUS
             else cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16
         )
-        config = cloud_speech.RecognitionConfig(
-            explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
-                encoding=encoding,
-                sample_rate_hertz=metadata.sample_rate,
-                audio_channel_count=metadata.channel,
+        yield cloud_speech.StreamingRecognizeRequest(
+            recognizer=f"projects/{self._project_id}/locations/{self._location}/recognizers/_",
+            streaming_config=cloud_speech.StreamingRecognitionConfig(
+                config=cloud_speech.RecognitionConfig(
+                    explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
+                        encoding=encoding,
+                        sample_rate_hertz=metadata.sample_rate,
+                        audio_channel_count=metadata.channel,
+                    ),
+                    language_codes=[metadata.language],
+                    model=self._model,
+                )
             ),
-            language_codes=[metadata.language],
-            model=self._model,
         )
-        project_id = self._service_account_info["project_id"]
-
-        # Create the client on first use, so that it is created inside the executor job
-        if self._client is None:
-            endpoint = (
-                "speech.googleapis.com"
-                if self._location == "global"
-                else f"{self._location}-speech.googleapis.com"
-            )
-            self._client = speech_v2.SpeechClient.from_service_account_info(
-                self._service_account_info,
-                client_options=ClientOptions(api_endpoint=endpoint),
-            )
-
-        return self._client.recognize(
-            request=cloud_speech.RecognizeRequest(
-                recognizer=f"projects/{project_id}/locations/{self._location}/recognizers/_",
-                config=config,
-                content=audio_data,
-            )
-        )
+        async for chunk in audio.chunks():
+            yield cloud_speech.StreamingRecognizeRequest(audio=chunk)
